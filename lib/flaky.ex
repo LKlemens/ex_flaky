@@ -22,6 +22,7 @@ defmodule Flaky do
           seed: integer() | nil,
           dry_run: boolean(),
           parallel: pos_integer() | nil,
+          mix: boolean(),
           failed: boolean(),
           print_full_log: boolean(),
           quiet: boolean(),
@@ -264,7 +265,19 @@ defmodule Flaky do
     iterations = opts[:iterations] || 100
     parallel = opts[:parallel]
     seed = opts[:seed]
+    mix_mode = opts[:mix] || false
 
+    if mix_mode do
+      run_test_targets_mix(test_targets, iterations, seed, parallel)
+    else
+      run_test_targets_grouped(test_targets, iterations, seed, parallel)
+    end
+    |> then(fn failed_tests -> print_summary(test_targets, failed_tests, iterations, opts) end)
+  end
+
+  @spec run_test_targets_grouped(list(String.t()), pos_integer(), integer() | nil, pos_integer() | nil) ::
+          list({String.t(), String.t()})
+  defp run_test_targets_grouped(test_targets, iterations, seed, parallel) do
     grouped_targets = group_by_file(test_targets)
     file_count = length(grouped_targets)
 
@@ -277,14 +290,40 @@ defmodule Flaky do
       )
     )
 
-    failed_tests =
-      if parallel do
-        run_tests_parallel(grouped_targets, iterations, seed, parallel)
-      else
-        run_tests_sequential(grouped_targets, iterations, seed)
-      end
+    if parallel do
+      run_tests_parallel(grouped_targets, iterations, seed, parallel)
+    else
+      run_tests_sequential(grouped_targets, iterations, seed)
+    end
+  end
 
-    print_summary(test_targets, failed_tests, iterations, opts)
+  @spec run_test_targets_mix(list(String.t()), pos_integer(), integer() | nil, pos_integer() | nil) ::
+          list({String.t(), String.t()})
+  defp run_test_targets_mix(test_targets, iterations, seed, parallel) do
+    test_count = length(test_targets)
+
+    if parallel do
+      batch_size = ceil(test_count / parallel)
+      batch_count = ceil(test_count / batch_size)
+
+      IO.puts(
+        color(
+          "\nRunning #{test_count} test(s) in #{batch_count} batch(es) across #{parallel} workers with --repeat-until-failure #{iterations}...\n",
+          @cyan
+        )
+      )
+
+      run_tests_mix_parallel(test_targets, iterations, seed, parallel)
+    else
+      IO.puts(
+        color(
+          "\nRunning #{test_count} test(s) together with --repeat-until-failure #{iterations}...\n",
+          @cyan
+        )
+      )
+
+      run_tests_mix_sequential(test_targets, iterations, seed)
+    end
   end
 
   @spec run_tests_sequential(list({String.t(), list(String.t())}), pos_integer(), integer() | nil) ::
@@ -325,7 +364,7 @@ defmodule Flaky do
           list({String.t(), String.t()})
   defp run_tests_parallel(grouped_targets, iterations, seed, concurrency) do
     total_files = length(grouped_targets)
-    {:ok, tracker} = Agent.start_link(fn -> init_tracker(concurrency, total_files) end)
+    {:ok, tracker} = Agent.start_link(fn -> init_tracker(concurrency, total_files, "files") end)
 
     # Print header and placeholder lines for workers
     IO.puts(color("  0/#{total_files} files", @yellow))
@@ -368,10 +407,121 @@ defmodule Flaky do
     failures
   end
 
-  @spec init_tracker(pos_integer(), pos_integer()) :: map()
-  defp init_tracker(concurrency, total_tests) do
+  @spec run_tests_mix_sequential(list(String.t()), pos_integer(), integer() | nil) ::
+          list({String.t(), String.t()})
+  defp run_tests_mix_sequential(test_targets, iterations, seed) do
+    IO.puts("Running all tests together...")
+
+    case run_file_tests(test_targets, iterations, seed) do
+      :passed ->
+        IO.puts(color("  ✓ PASSED\n", @green))
+        []
+
+      {:failed, output} ->
+        log_path = save_failure_output("mix_all", output)
+        IO.puts(color("  ✗ FAILED (output saved to #{log_path})\n", @red))
+        actually_failed = parse_failed_tests(output, test_targets)
+        Enum.map(actually_failed, fn target -> {target, log_path} end)
+    end
+  end
+
+  @spec run_tests_mix_parallel(list(String.t()), pos_integer(), integer() | nil, pos_integer()) ::
+          list({String.t(), String.t()})
+  defp run_tests_mix_parallel(test_targets, iterations, seed, concurrency) do
+    # Chunk tests into batches - one batch per worker
+    batch_size = ceil(length(test_targets) / concurrency)
+    batches = Enum.chunk_every(test_targets, batch_size)
+    batch_count = length(batches)
+
+    {:ok, tracker} = Agent.start_link(fn -> init_tracker(concurrency, batch_count, "batches") end)
+
+    # Print header and placeholder lines for workers
+    IO.puts(color("  0/#{batch_count} batches", @yellow))
+    for i <- 1..concurrency, do: IO.puts("  Worker #{i}: [waiting]")
+
+    # Placeholder for failures section
+    IO.puts("")
+
+    batches
+    |> Enum.with_index()
+    |> Task.async_stream(
+      fn {batch_targets, batch_index} ->
+        batch_label = "batch #{batch_index + 1} (#{length(batch_targets)} tests)"
+        slot = claim_slot(tracker, batch_label)
+
+        result =
+          run_batch_tests_parallel(batch_targets, iterations, seed, tracker, slot, concurrency, batch_label)
+
+        increment_completed(tracker, concurrency)
+
+        case result do
+          :passed ->
+            :ok
+
+          {:failed, output} ->
+            log_path = save_failure_output("batch_#{batch_index + 1}", output)
+            add_batch_failures(tracker, batch_targets, output, log_path, concurrency)
+        end
+
+        release_slot(tracker, slot)
+        {batch_targets, result}
+      end,
+      max_concurrency: concurrency,
+      timeout: :infinity
+    )
+    |> Stream.run()
+
+    # Get failures from tracker
+    failures = Agent.get(tracker, & &1.failures)
+    Agent.stop(tracker)
+
+    failures
+  end
+
+  @spec run_batch_tests_parallel(
+          list(String.t()),
+          pos_integer(),
+          integer() | nil,
+          pid(),
+          non_neg_integer(),
+          pos_integer(),
+          String.t()
+        ) :: :passed | {:failed, String.t()}
+  defp run_batch_tests_parallel(targets, iterations, seed, tracker, slot, concurrency, label) do
+    args =
+      ["test"] ++
+        targets ++
+        ["--repeat-until-failure", to_string(iterations)] ++
+        seed_args(seed)
+
+    port =
+      Port.open(
+        {:spawn_executable, System.find_executable("mix")},
+        [:binary, :exit_status, :stderr_to_stdout, args: args]
+      )
+
+    collect_output_parallel(port, iterations, 0, [], tracker, slot, concurrency, label)
+  end
+
+  @spec add_batch_failures(pid(), list(String.t()), String.t(), String.t(), pos_integer()) :: :ok
+  defp add_batch_failures(tracker, batch_targets, output, log_path, _concurrency) do
+    # Parse output to find only the tests that actually failed
+    actually_failed = parse_failed_tests(output, batch_targets)
+    failed_targets = Enum.map(actually_failed, fn target -> {target, log_path} end)
+
+    Agent.update(tracker, fn state ->
+      %{state | failures: state.failures ++ failed_targets}
+    end)
+
+    append_to_combined_log("batch", log_path)
+    failed_count = length(actually_failed)
+    IO.puts("  #{color("✗ FAILED:", @red)} #{failed_count} test(s) -> #{log_path}")
+  end
+
+  @spec init_tracker(pos_integer(), pos_integer(), String.t()) :: map()
+  defp init_tracker(concurrency, total, unit) do
     slots = for i <- 0..(concurrency - 1), into: %{}, do: {i, nil}
-    %{slots: slots, concurrency: concurrency, completed: 0, total: total_tests, failures: []}
+    %{slots: slots, concurrency: concurrency, completed: 0, total: total, unit: unit, failures: []}
   end
 
   @spec claim_slot(pid(), String.t()) :: non_neg_integer()
@@ -410,15 +560,15 @@ defmodule Flaky do
 
   @spec increment_completed(pid(), pos_integer()) :: :ok
   defp increment_completed(tracker, concurrency) do
-    {completed, total, failure_count} =
+    {completed, total, unit, failure_count} =
       Agent.get_and_update(tracker, fn state ->
         new_completed = state.completed + 1
 
-        {{new_completed, state.total, length(state.failures)},
+        {{new_completed, state.total, state.unit, length(state.failures)},
          %{state | completed: new_completed}}
       end)
 
-    update_header(completed, total, concurrency, failure_count)
+    update_header(completed, total, unit, concurrency, failure_count)
   end
 
   @spec add_failures(pid(), list(String.t()), String.t(), String.t(), pos_integer(), String.t()) ::
@@ -441,12 +591,13 @@ defmodule Flaky do
     IO.puts("  #{color("✗ FAILED:", @red)} #{file} (#{test_count} test(s)) -> #{log_path}")
   end
 
-  @spec update_header(non_neg_integer(), pos_integer(), pos_integer(), non_neg_integer()) :: :ok
-  defp update_header(completed, total, concurrency, failure_count) do
+  @spec update_header(non_neg_integer(), pos_integer(), String.t(), pos_integer(), non_neg_integer()) ::
+          :ok
+  defp update_header(completed, total, unit, concurrency, failure_count) do
     # header(1) + workers + empty(1) + failures
     lines_up = concurrency + 2 + failure_count
     header_color = if completed == total, do: @green, else: @yellow
-    update_line(lines_up, color("  #{completed}/#{total} files", header_color))
+    update_line(lines_up, color("  #{completed}/#{total} #{unit}", header_color))
   end
 
   @spec run_file_tests(list(String.t()), pos_integer(), integer() | nil) ::
@@ -624,14 +775,27 @@ defmodule Flaky do
     IO.write("#{cursor_up}#{@clear_line}\r#{content}#{cursor_down}\r")
   end
 
+  @spec unit_label(opts(), pos_integer()) :: String.t()
+  defp unit_label(opts, count) do
+    mix_mode = opts[:mix] || false
+    parallel = opts[:parallel]
+
+    if mix_mode && parallel do
+      batch_count = min(parallel, count)
+      "#{count} test(s) in #{batch_count} batch(es)"
+    else
+      "#{count} test(s)"
+    end
+  end
+
   @spec print_summary(list(String.t()), list({String.t(), String.t()}), pos_integer(), opts()) ::
           :ok | {:error, String.t()}
-  defp print_summary(all_tests, [], iterations, _opts) do
+  defp print_summary(all_tests, [], iterations, opts) do
     IO.puts("")
     IO.puts(color("========================================", @green))
     IO.puts(color("SUMMARY", @green))
     IO.puts(color("========================================", @green))
-    IO.puts(color("All #{length(all_tests)} test(s) passed #{iterations} iterations!", @green))
+    IO.puts(color("All #{unit_label(opts, length(all_tests))} passed #{iterations} iterations!", @green))
     IO.puts("")
 
     :ok
@@ -647,7 +811,7 @@ defmodule Flaky do
     IO.puts(color("========================================", @yellow))
     IO.puts(color("SUMMARY (#{iterations} iterations each)", @yellow))
     IO.puts(color("========================================", @yellow))
-    IO.puts(color("Failed: #{length(failed_tests)}/#{length(all_tests)}", @red))
+    IO.puts(color("Failed: #{length(failed_tests)}/#{unit_label(opts, length(all_tests))}", @red))
     IO.puts("")
 
     Enum.each(failed_tests, fn {target, log_path} ->

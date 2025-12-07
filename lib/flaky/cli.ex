@@ -15,6 +15,7 @@ defmodule Flaky.CLI do
       -s, --seed SEED       Specific seed for reproducibility
       --dry-run             Show which tests would be run without running them
       -p, --parallel N      Run tests in parallel with N concurrent processes
+      -m, --mix             Distribute tests in batches across workers (with -p) or run all together (sequential)
       -f, --failed          Re-run only previously failed tests
       -l, --print-full-log  Show full error logs (default: 10 lines)
       -q, --quiet           Suppress error snippets and limit test list to 10
@@ -28,7 +29,7 @@ defmodule Flaky.CLI do
       flaky --seed 12345 --iterations 200
       flaky --dry-run
       flaky --parallel 3
-      flaky -p 5
+      flaky -p 5 --mix
       flaky --failed
       flaky --print-full-log
   """
@@ -39,6 +40,7 @@ defmodule Flaky.CLI do
     seed: :integer,
     dry_run: :boolean,
     parallel: :integer,
+    mix: :boolean,
     failed: :boolean,
     print_full_log: :boolean,
     quiet: :boolean,
@@ -51,6 +53,7 @@ defmodule Flaky.CLI do
     b: :base,
     s: :seed,
     p: :parallel,
+    m: :mix,
     f: :failed,
     l: :print_full_log,
     q: :quiet,
@@ -79,6 +82,7 @@ defmodule Flaky.CLI do
           seed: Keyword.get(opts, :seed),
           dry_run: Keyword.get(opts, :dry_run, false),
           parallel: Keyword.get(opts, :parallel),
+          mix: Keyword.get(opts, :mix, false),
           failed: Keyword.get(opts, :failed, false),
           print_full_log: Keyword.get(opts, :print_full_log, false),
           quiet: Keyword.get(opts, :quiet, false),
