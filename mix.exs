@@ -17,7 +17,7 @@ defmodule ExFlaky.MixProject do
   defp package do
     [
       licenses: ["MIT"],
-      links: %{"GitHub" => "https://github.com/klemens/ex_flaky"}
+      links: %{"GitHub" => "https://github.com/LKlemens/ex_flaky"}
     ]
   end
 
