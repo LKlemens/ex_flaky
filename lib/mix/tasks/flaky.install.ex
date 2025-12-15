@@ -24,7 +24,6 @@ defmodule Mix.Tasks.Flaky.Install do
 
     case System.cmd("mix", ["escript.build"],
            cd: flaky_path,
-           env: [{"MIX_ENV", "prod"}],
            stderr_to_stdout: true
          ) do
       {_output, 0} ->
@@ -36,10 +35,7 @@ defmodule Mix.Tasks.Flaky.Install do
 
     Mix.shell().info("Installing #{escript_path}...")
 
-    case System.cmd("mix", ["escript.install", "--force", escript_path],
-           env: [{"MIX_ENV", "prod"}],
-           stderr_to_stdout: true
-         ) do
+    case System.cmd("mix", ["escript.install", "--force", escript_path], stderr_to_stdout: true) do
       {output, 0} ->
         Mix.shell().info(output)
         :ok
