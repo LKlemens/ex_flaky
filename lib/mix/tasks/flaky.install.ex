@@ -19,6 +19,7 @@ defmodule Mix.Tasks.Flaky.Install do
   def run(_args) do
     flaky_path = find_flaky_path()
     escript_path = Path.join(flaky_path, "flaky")
+    ensure_deps(flaky_path)
 
     Mix.shell().info("Building escript in #{flaky_path}...")
 
@@ -56,6 +57,15 @@ defmodule Mix.Tasks.Flaky.Install do
 
       true ->
         Mix.raise("Could not find ex_flaky project")
+    end
+  end
+
+  defp ensure_deps(flaky_path) do
+    Mix.shell().info("Fetching dependencies in #{flaky_path}...")
+
+    case System.cmd("mix", ["deps.get"], cd: flaky_path, stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {output, _code} -> Mix.raise("Failed to fetch dependencies:\n#{output}")
     end
   end
 end

@@ -9,7 +9,7 @@ Add to your `mix.exs`:
 ```elixir
 def deps do
   [
-    {:ex_flaky, "~> 0.1.1", only: :dev}
+    {:ex_flaky, "~> 0.1.2", only: :dev}
   ]
 end
 ```
